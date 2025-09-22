@@ -14,8 +14,89 @@ export interface CodexProviderPreset {
 }
 
 /**
- * 生成第三方供应商的 auth.json
+ * 生成自用供应商的 auth.json
  */
+export function generateZiyongAuth(apiKey: string): Record<string, any> {
+  return {
+    OPENAI_API_KEY: apiKey || "sk-your-api-key-here"
+  };
+}
+
+/**
+ * 生成自用供应商的 config.toml
+ */
+export function generateZiyongConfig(
+  baseUrl: string,
+  modelName = "gpt-5-codex"
+): string {
+  return `model_provider = "ziyong"
+model = "${modelName}"
+model_reasoning_effort = "high"
+disable_response_storage = true
+
+[model_providers.ziyong]
+name = "ziyong"
+base_url = "${baseUrl}"
+wire_api = "responses"
+env_key = "ziyong"
+
+[projects.'\\\\?\\C:\\Users\\60350\\Desktop\\halo-plugin-vditor']
+trust_level = "trusted"
+
+[projects.'\\\\?\\C:\\Users\\60350\\Desktop\\xhs']
+trust_level = "trusted"
+
+[projects.'\\\\?\\C:\\Users\\60350\\CF2DNS']
+trust_level = "trusted"
+
+[projects.'C:\\Users\\60350\\.codex']
+trust_level = "trusted"
+
+[projects.'\\\\?\\C:\\Users\\60350\\Desktop\\官网']
+trust_level = "trusted"
+
+# --- MCP servers added by Codex CLI ---
+[mcp_servers.context7]
+command = "C:\\\\Users\\\\60350\\\\AppData\\\\Roaming\\\\npm\\\\context7-mcp.cmd"
+args = []
+env = {SYSTEMROOT = 'C:\\Windows'}
+
+[mcp_servers.sequential-thinking]
+command = "C:\\\\Users\\\\60350\\\\AppData\\\\Roaming\\\\npm\\\\mcp-server-sequential-thinking.cmd"
+args = []
+env = {SYSTEMROOT = 'C:\\Windows'}
+
+[mcp_servers.playwright]
+command = "C:\\\\Users\\\\60350\\\\AppData\\\\Roaming\\\\npm\\\\mcp-server-playwright.cmd"
+args = []
+env = {SYSTEMROOT = 'C:\\Windows'}
+
+[mcp_servers.mcp-server-time]
+command = "C:\\\\Users\\\\60350\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python313\\\\Scripts\\\\uvx.exe"
+args = ["mcp-server-time", "--local-timezone=Asia/Shanghai"]
+env = {SYSTEMROOT = 'C:\\Windows'}
+
+[mcp_servers.mcp-shrimp-task-manager]
+command = "C:\\\\Users\\\\60350\\\\AppData\\\\Roaming\\\\npm\\\\mcp-shrimp-task-manager.cmd"
+args = []
+env = { DATA_DIR = "C:/Users/60350/.codex/mcp-data/shrimp", TEMPLATES_USE = "zh", ENABLE_GUI = "false" }
+
+[mcp_servers.mcp-deepwiki]
+command = "C:\\\\Program Files\\\\nodejs\\\\npx.cmd"
+args = ["-y", "mcp-deepwiki@latest"]
+env = {SYSTEMROOT = 'C:\\Windows'}
+
+[mcp_servers.desktop-commander]
+command = "C:\\\\Users\\\\60350\\\\AppData\\\\Roaming\\\\npm\\\\desktop-commander.cmd"
+args = []
+env = {SYSTEMROOT = 'C:\\Windows'}
+
+[mcp_servers.exa]
+command = "C:\\\\Users\\\\60350\\\\AppData\\\\Roaming\\\\npm\\\\mcp-server-exa.cmd"
+args = []
+env = {SYSTEMROOT = 'C:\\Windows'}
+# --- End MCP servers ---`;
+}
 export function generateThirdPartyAuth(apiKey: string): Record<string, any> {
   return {
     OPENAI_API_KEY: apiKey || "sk-your-api-key-here"
@@ -59,6 +140,14 @@ export const codexProviderPresets: CodexProviderPreset[] = [
       OPENAI_API_KEY: null,
     },
     config: ``,
+  },
+  {
+    name: "自用",
+    websiteUrl: "",
+    category: "ziyong",
+    isCustomTemplate: true,
+    auth: generateZiyongAuth(""),
+    config: generateZiyongConfig("https://your-api-endpoint.com/v1", "gpt-5-codex"),
   },
   {
     name: "PackyCode",

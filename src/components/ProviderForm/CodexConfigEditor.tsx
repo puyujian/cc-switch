@@ -7,6 +7,8 @@ import { isLinux } from "../../lib/platform";
 import {
   generateThirdPartyAuth,
   generateThirdPartyConfig,
+  generateZiyongAuth,
+  generateZiyongConfig,
 } from "../../config/codexProviderPresets";
 
 interface CodexConfigEditorProps {
@@ -33,6 +35,8 @@ interface CodexConfigEditorProps {
   authError: string;
 
   isCustomMode?: boolean; // 新增：是否为自定义模式
+
+  isZiyongMode?: boolean; // 新增：是否为自用模式
 
   onWebsiteUrlChange?: (url: string) => void; // 新增：更新网址回调
 
@@ -65,6 +69,8 @@ const CodexConfigEditor: React.FC<CodexConfigEditorProps> = ({
   commonConfigError,
 
   authError,
+
+  isZiyongMode,
 
   onWebsiteUrlChange,
 
@@ -102,6 +108,10 @@ const CodexConfigEditor: React.FC<CodexConfigEditorProps> = ({
 
   const modelNameInputRef = useRef<HTMLInputElement>(null);
   const displayNameInputRef = useRef<HTMLInputElement>(null);
+
+  // 自用模式的状态
+  const [ziyongApiKey, setZiyongApiKey] = useState("");
+  const [ziyongBaseUrl, setZiyongBaseUrl] = useState("");
 
   // 移除自动填充逻辑，因为现在在点击自定义按钮时就已经填充
 
@@ -205,6 +215,41 @@ const CodexConfigEditor: React.FC<CodexConfigEditorProps> = ({
     closeTemplateModal();
   };
 
+  // 自用模式：处理 API Key 变化
+  const handleZiyongApiKeyChange = (value: string) => {
+    setZiyongApiKey(value);
+    const auth = generateZiyongAuth(value.trim());
+    onAuthChange(JSON.stringify(auth, null, 2));
+  };
+
+  // 自用模式：处理 API 地址变化
+  const handleZiyongBaseUrlChange = (value: string) => {
+    setZiyongBaseUrl(value);
+    const config = generateZiyongConfig(value.trim(), "gpt-5-codex");
+    onConfigChange(config);
+  };
+
+  // 自用模式：从现有配置中提取值
+  useEffect(() => {
+    if (isZiyongMode) {
+      // 从 authValue 中提取 API Key
+      try {
+        const auth = JSON.parse(authValue || "{}");
+        if (auth.OPENAI_API_KEY && typeof auth.OPENAI_API_KEY === "string") {
+          setZiyongApiKey(auth.OPENAI_API_KEY);
+        }
+      } catch {
+        // ignore
+      }
+
+      // 从 configValue 中提取 base_url
+      const baseUrlMatch = configValue.match(/base_url\s*=\s*"([^"]+)"/);
+      if (baseUrlMatch && baseUrlMatch[1]) {
+        setZiyongBaseUrl(baseUrlMatch[1]);
+      }
+    }
+  }, [isZiyongMode, authValue, configValue]);
+
   const handleTemplateInputKeyDown = (
     e: React.KeyboardEvent<HTMLInputElement>
   ) => {
@@ -231,6 +276,59 @@ const CodexConfigEditor: React.FC<CodexConfigEditorProps> = ({
 
   return (
     <div className="space-y-6">
+      {/* 自用模式的简化配置界面 */}
+      {isZiyongMode && (
+        <div className="space-y-4 p-4 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-lg">
+          <h3 className="text-sm font-medium text-blue-800 dark:text-blue-200">
+            自用供应商配置
+          </h3>
+          
+          <div className="grid grid-cols-1 gap-4">
+            <div className="space-y-2">
+              <label
+                htmlFor="ziyongApiKey"
+                className="block text-sm font-medium text-gray-900 dark:text-gray-100"
+              >
+                API Key *
+              </label>
+              <input
+                type="text"
+                id="ziyongApiKey"
+                value={ziyongApiKey}
+                onChange={(e) => handleZiyongApiKeyChange(e.target.value)}
+                placeholder="sk-your-api-key-here"
+                required
+                className="w-full px-3 py-2 border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500/20 dark:focus:ring-blue-400/20 focus:border-blue-500 dark:focus:border-blue-400 transition-colors"
+              />
+            </div>
+            
+            <div className="space-y-2">
+              <label
+                htmlFor="ziyongBaseUrl"
+                className="block text-sm font-medium text-gray-900 dark:text-gray-100"
+              >
+                API 地址 *
+              </label>
+              <input
+                type="url"
+                id="ziyongBaseUrl"
+                value={ziyongBaseUrl}
+                onChange={(e) => handleZiyongBaseUrlChange(e.target.value)}
+                placeholder="https://your-api-endpoint.com/v1"
+                required
+                className="w-full px-3 py-2 border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500/20 dark:focus:ring-blue-400/20 focus:border-blue-500 dark:focus:border-blue-400 transition-colors"
+              />
+            </div>
+          </div>
+          
+          <div className="p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-lg">
+            <p className="text-xs text-amber-600 dark:text-amber-400">
+              💡 填写完成后，系统将自动更新 auth.json 和 config.toml 配置
+            </p>
+          </div>
+        </div>
+      )}
+
       <div className="space-y-2">
         <label
           htmlFor="codexAuth"

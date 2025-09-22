@@ -1231,6 +1231,11 @@ const ProviderForm: React.FC<ProviderFormProps> = ({
                 commonConfigError={codexCommonConfigError}
                 authError={codexAuthError}
                 isCustomMode={selectedCodexPreset === -1}
+                isZiyongMode={
+                  selectedCodexPreset !== null &&
+                  selectedCodexPreset >= 0 &&
+                  codexProviderPresets[selectedCodexPreset]?.category === "ziyong"
+                }
                 onWebsiteUrlChange={(url) => {
                   setFormData({
                     ...formData,
