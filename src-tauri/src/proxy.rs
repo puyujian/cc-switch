@@ -133,7 +133,7 @@ async fn get_enabled_proxy_providers(
 ) -> Result<Vec<Provider>, String> {
     let config = app_state
         .config
-        .lock()
+        .read()
         .map_err(|e| format!("获取锁失败: {}", e))?;
 
     let manager = config
@@ -488,7 +488,7 @@ pub fn switch_to_write_mode(app_state: &AppState) -> Result<(), String> {
     {
         let mut config = app_state
             .config
-            .lock()
+            .write()
             .map_err(|e| format!("获取锁失败: {}", e))?;
 
         if let Some(manager) = config.get_manager_mut(&AppType::Claude) {

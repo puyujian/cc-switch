@@ -5,17 +5,43 @@ mod claude_plugin;
 mod codex_config;
 mod commands;
 mod config;
-mod import_export;
+mod deeplink;
+mod error;
+mod gemini_config; // 新增
+mod gemini_mcp;
+mod init_status;
 mod mcp;
-mod migration;
+mod prompt;
+mod prompt_files;
 mod provider;
 mod proxy;
+mod services;
 mod settings;
-mod speedtest;
-mod usage_script;
 mod store;
+mod usage_script;
 
-use store::AppState;
+pub use app_config::{AppType, McpApps, McpServer, MultiAppConfig};
+pub use codex_config::{get_codex_auth_path, get_codex_config_path, write_codex_live_atomic};
+pub use commands::*;
+pub use config::{get_claude_mcp_path, get_claude_settings_path, read_json_file};
+pub use deeplink::{import_provider_from_deeplink, parse_deeplink_url, DeepLinkImportRequest};
+pub use error::AppError;
+pub use mcp::{
+    import_from_claude, import_from_codex, import_from_gemini, remove_server_from_claude,
+    remove_server_from_codex, remove_server_from_gemini, sync_enabled_to_claude,
+    sync_enabled_to_codex, sync_enabled_to_gemini, sync_single_server_to_claude,
+    sync_single_server_to_codex, sync_single_server_to_gemini,
+};
+pub use provider::{Provider, ProviderMeta};
+pub use services::{
+    ConfigService, EndpointLatency, McpService, PromptService, ProviderService, SkillService,
+    SpeedtestService,
+};
+pub use settings::{update_settings, AppSettings};
+pub use store::AppState;
+use tauri_plugin_deep_link::DeepLinkExt;
+
+use std::sync::Arc;
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuBuilder, MenuItem},
     tray::{TrayIconBuilder, TrayIconEvent},
@@ -24,145 +50,191 @@ use tauri::{
 use tauri::{ActivationPolicy, RunEvent};
 use tauri::{Emitter, Manager};
 
+#[derive(Clone, Copy)]
+struct TrayTexts {
+    show_main: &'static str,
+    no_provider_hint: &'static str,
+    quit: &'static str,
+}
+
+impl TrayTexts {
+    fn from_language(language: &str) -> Self {
+        match language {
+            "en" => Self {
+                show_main: "Open main window",
+                no_provider_hint: "  (No providers yet, please add them from the main window)",
+                quit: "Quit",
+            },
+            _ => Self {
+                show_main: "打开主界面",
+                no_provider_hint: "  (无供应商，请在主界面添加)",
+                quit: "退出",
+            },
+        }
+    }
+}
+
+struct TrayAppSection {
+    app_type: AppType,
+    prefix: &'static str,
+    header_id: &'static str,
+    empty_id: &'static str,
+    header_label: &'static str,
+    log_name: &'static str,
+}
+
+const TRAY_SECTIONS: [TrayAppSection; 3] = [
+    TrayAppSection {
+        app_type: AppType::Claude,
+        prefix: "claude_",
+        header_id: "claude_header",
+        empty_id: "claude_empty",
+        header_label: "─── Claude ───",
+        log_name: "Claude",
+    },
+    TrayAppSection {
+        app_type: AppType::Codex,
+        prefix: "codex_",
+        header_id: "codex_header",
+        empty_id: "codex_empty",
+        header_label: "─── Codex ───",
+        log_name: "Codex",
+    },
+    TrayAppSection {
+        app_type: AppType::Gemini,
+        prefix: "gemini_",
+        header_id: "gemini_header",
+        empty_id: "gemini_empty",
+        header_label: "─── Gemini ───",
+        log_name: "Gemini",
+    },
+];
+
+fn append_provider_section<'a>(
+    app: &'a tauri::AppHandle,
+    mut menu_builder: MenuBuilder<'a, tauri::Wry, tauri::AppHandle<tauri::Wry>>,
+    manager: Option<&crate::provider::ProviderManager>,
+    section: &TrayAppSection,
+    tray_texts: &TrayTexts,
+) -> Result<MenuBuilder<'a, tauri::Wry, tauri::AppHandle<tauri::Wry>>, AppError> {
+    let Some(manager) = manager else {
+        return Ok(menu_builder);
+    };
+
+    let header = MenuItem::with_id(
+        app,
+        section.header_id,
+        section.header_label,
+        false,
+        None::<&str>,
+    )
+    .map_err(|e| AppError::Message(format!("创建{}标题失败: {e}", section.log_name)))?;
+    menu_builder = menu_builder.item(&header);
+
+    if manager.providers.is_empty() {
+        let empty_hint = MenuItem::with_id(
+            app,
+            section.empty_id,
+            tray_texts.no_provider_hint,
+            false,
+            None::<&str>,
+        )
+        .map_err(|e| AppError::Message(format!("创建{}空提示失败: {e}", section.log_name)))?;
+        return Ok(menu_builder.item(&empty_hint));
+    }
+
+    let mut sorted_providers: Vec<_> = manager.providers.iter().collect();
+    sorted_providers.sort_by(|(_, a), (_, b)| {
+        match (a.sort_index, b.sort_index) {
+            (Some(idx_a), Some(idx_b)) => return idx_a.cmp(&idx_b),
+            (Some(_), None) => return std::cmp::Ordering::Less,
+            (None, Some(_)) => return std::cmp::Ordering::Greater,
+            _ => {}
+        }
+
+        match (a.created_at, b.created_at) {
+            (Some(time_a), Some(time_b)) => return time_a.cmp(&time_b),
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            _ => {}
+        }
+
+        a.name.cmp(&b.name)
+    });
+
+    for (id, provider) in sorted_providers {
+        let is_current = manager.current == *id;
+        let item = CheckMenuItem::with_id(
+            app,
+            format!("{}{}", section.prefix, id),
+            &provider.name,
+            true,
+            is_current,
+            None::<&str>,
+        )
+        .map_err(|e| AppError::Message(format!("创建{}菜单项失败: {e}", section.log_name)))?;
+        menu_builder = menu_builder.item(&item);
+    }
+
+    Ok(menu_builder)
+}
+
+fn handle_provider_tray_event(app: &tauri::AppHandle, event_id: &str) -> bool {
+    for section in TRAY_SECTIONS.iter() {
+        if let Some(provider_id) = event_id.strip_prefix(section.prefix) {
+            log::info!("切换到{}供应商: {provider_id}", section.log_name);
+            let app_handle = app.clone();
+            let provider_id = provider_id.to_string();
+            let app_type = section.app_type.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(e) = switch_provider_internal(&app_handle, app_type, provider_id) {
+                    log::error!("切换{}供应商失败: {e}", section.log_name);
+                }
+            });
+            return true;
+        }
+    }
+    false
+}
+
 /// 创建动态托盘菜单
 fn create_tray_menu(
     app: &tauri::AppHandle,
     app_state: &AppState,
-) -> Result<Menu<tauri::Wry>, String> {
-    let config = app_state
-        .config
-        .lock()
-        .map_err(|e| format!("获取锁失败: {}", e))?;
+) -> Result<Menu<tauri::Wry>, AppError> {
+    let app_settings = crate::settings::get_settings();
+    let tray_texts = TrayTexts::from_language(app_settings.language.as_deref().unwrap_or("zh"));
+
+    let config = app_state.config.read().map_err(AppError::from)?;
 
     let mut menu_builder = MenuBuilder::new(app);
 
     // 顶部：打开主界面
-    let show_main_item = MenuItem::with_id(app, "show_main", "打开主界面", true, None::<&str>)
-        .map_err(|e| format!("创建打开主界面菜单失败: {}", e))?;
+    let show_main_item =
+        MenuItem::with_id(app, "show_main", tray_texts.show_main, true, None::<&str>)
+            .map_err(|e| AppError::Message(format!("创建打开主界面菜单失败: {e}")))?;
     menu_builder = menu_builder.item(&show_main_item).separator();
 
     // 直接添加所有供应商到主菜单（扁平化结构，更简单可靠）
-    if let Some(claude_manager) = config.get_manager(&crate::app_config::AppType::Claude) {
-        // 添加Claude标题（禁用状态，仅作为分组标识）
-        let claude_header =
-            MenuItem::with_id(app, "claude_header", "─── Claude ───", false, None::<&str>)
-                .map_err(|e| format!("创建Claude标题失败: {}", e))?;
-        menu_builder = menu_builder.item(&claude_header);
-
-        if !claude_manager.providers.is_empty() {
-            // Sort providers by sortIndex, then by createdAt, then by name
-            let mut sorted_providers: Vec<_> = claude_manager.providers.iter().collect();
-            sorted_providers.sort_by(|(_, a), (_, b)| {
-                // Priority 1: sortIndex
-                match (a.sort_index, b.sort_index) {
-                    (Some(idx_a), Some(idx_b)) => return idx_a.cmp(&idx_b),
-                    (Some(_), None) => return std::cmp::Ordering::Less,
-                    (None, Some(_)) => return std::cmp::Ordering::Greater,
-                    _ => {}
-                }
-                // Priority 2: createdAt
-                match (a.created_at, b.created_at) {
-                    (Some(time_a), Some(time_b)) => return time_a.cmp(&time_b),
-                    (Some(_), None) => return std::cmp::Ordering::Greater,
-                    (None, Some(_)) => return std::cmp::Ordering::Less,
-                    _ => {}
-                }
-                // Priority 3: name
-                a.name.cmp(&b.name)
-            });
-
-            for (id, provider) in sorted_providers {
-                let is_current = claude_manager.current == *id;
-                let item = CheckMenuItem::with_id(
-                    app,
-                    format!("claude_{}", id),
-                    &provider.name,
-                    true,
-                    is_current,
-                    None::<&str>,
-                )
-                .map_err(|e| format!("创建菜单项失败: {}", e))?;
-                menu_builder = menu_builder.item(&item);
-            }
-        } else {
-            // 没有供应商时显示提示
-            let empty_hint = MenuItem::with_id(
-                app,
-                "claude_empty",
-                "  (无供应商，请在主界面添加)",
-                false,
-                None::<&str>,
-            )
-            .map_err(|e| format!("创建Claude空提示失败: {}", e))?;
-            menu_builder = menu_builder.item(&empty_hint);
-        }
-    }
-
-    if let Some(codex_manager) = config.get_manager(&crate::app_config::AppType::Codex) {
-        // 添加Codex标题（禁用状态，仅作为分组标识）
-        let codex_header =
-            MenuItem::with_id(app, "codex_header", "─── Codex ───", false, None::<&str>)
-                .map_err(|e| format!("创建Codex标题失败: {}", e))?;
-        menu_builder = menu_builder.item(&codex_header);
-
-        if !codex_manager.providers.is_empty() {
-            // Sort providers by sortIndex, then by createdAt, then by name
-            let mut sorted_providers: Vec<_> = codex_manager.providers.iter().collect();
-            sorted_providers.sort_by(|(_, a), (_, b)| {
-                // Priority 1: sortIndex
-                match (a.sort_index, b.sort_index) {
-                    (Some(idx_a), Some(idx_b)) => return idx_a.cmp(&idx_b),
-                    (Some(_), None) => return std::cmp::Ordering::Less,
-                    (None, Some(_)) => return std::cmp::Ordering::Greater,
-                    _ => {}
-                }
-                // Priority 2: createdAt
-                match (a.created_at, b.created_at) {
-                    (Some(time_a), Some(time_b)) => return time_a.cmp(&time_b),
-                    (Some(_), None) => return std::cmp::Ordering::Greater,
-                    (None, Some(_)) => return std::cmp::Ordering::Less,
-                    _ => {}
-                }
-                // Priority 3: name
-                a.name.cmp(&b.name)
-            });
-
-            for (id, provider) in sorted_providers {
-                let is_current = codex_manager.current == *id;
-                let item = CheckMenuItem::with_id(
-                    app,
-                    format!("codex_{}", id),
-                    &provider.name,
-                    true,
-                    is_current,
-                    None::<&str>,
-                )
-                .map_err(|e| format!("创建菜单项失败: {}", e))?;
-                menu_builder = menu_builder.item(&item);
-            }
-        } else {
-            // 没有供应商时显示提示
-            let empty_hint = MenuItem::with_id(
-                app,
-                "codex_empty",
-                "  (无供应商，请在主界面添加)",
-                false,
-                None::<&str>,
-            )
-            .map_err(|e| format!("创建Codex空提示失败: {}", e))?;
-            menu_builder = menu_builder.item(&empty_hint);
-        }
+    for section in TRAY_SECTIONS.iter() {
+        menu_builder = append_provider_section(
+            app,
+            menu_builder,
+            config.get_manager(&section.app_type),
+            section,
+            &tray_texts,
+        )?;
     }
 
     // 分隔符和退出菜单
-    let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)
-        .map_err(|e| format!("创建退出菜单失败: {}", e))?;
+    let quit_item = MenuItem::with_id(app, "quit", tray_texts.quit, true, None::<&str>)
+        .map_err(|e| AppError::Message(format!("创建退出菜单失败: {e}")))?;
 
     menu_builder = menu_builder.separator().item(&quit_item);
 
     menu_builder
         .build()
-        .map_err(|e| format!("构建菜单失败: {}", e))
+        .map_err(|e| AppError::Message(format!("构建菜单失败: {e}")))
 }
 
 #[cfg(target_os = "macos")]
@@ -174,17 +246,17 @@ fn apply_tray_policy(app: &tauri::AppHandle, dock_visible: bool) {
     };
 
     if let Err(err) = app.set_dock_visibility(dock_visible) {
-        log::warn!("设置 Dock 显示状态失败: {}", err);
+        log::warn!("设置 Dock 显示状态失败: {err}");
     }
 
     if let Err(err) = app.set_activation_policy(desired_policy) {
-        log::warn!("设置激活策略失败: {}", err);
+        log::warn!("设置激活策略失败: {err}");
     }
 }
 
 /// 处理托盘菜单事件
 fn handle_tray_menu_event(app: &tauri::AppHandle, event_id: &str) {
-    log::info!("处理托盘菜单事件: {}", event_id);
+    log::info!("处理托盘菜单事件: {event_id}");
 
     match event_id {
         "show_main" => {
@@ -206,77 +278,95 @@ fn handle_tray_menu_event(app: &tauri::AppHandle, event_id: &str) {
             log::info!("退出应用");
             app.exit(0);
         }
-        id if id.starts_with("claude_") => {
-            let provider_id = id.strip_prefix("claude_").unwrap();
-            log::info!("切换到Claude供应商: {}", provider_id);
-
-            // 执行切换
-            let app_handle = app.clone();
-            let provider_id = provider_id.to_string();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = switch_provider_internal(
-                    &app_handle,
-                    crate::app_config::AppType::Claude,
-                    provider_id,
-                )
-                .await
-                {
-                    log::error!("切换Claude供应商失败: {}", e);
-                }
-            });
-        }
-        id if id.starts_with("codex_") => {
-            let provider_id = id.strip_prefix("codex_").unwrap();
-            log::info!("切换到Codex供应商: {}", provider_id);
-
-            // 执行切换
-            let app_handle = app.clone();
-            let provider_id = provider_id.to_string();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = switch_provider_internal(
-                    &app_handle,
-                    crate::app_config::AppType::Codex,
-                    provider_id,
-                )
-                .await
-                {
-                    log::error!("切换Codex供应商失败: {}", e);
-                }
-            });
-        }
         _ => {
-            log::warn!("未处理的菜单事件: {}", event_id);
+            if handle_provider_tray_event(app, event_id) {
+                return;
+            }
+            log::warn!("未处理的菜单事件: {event_id}");
         }
     }
+}
+
+/// 统一处理 ccswitch:// 深链接 URL
+///
+/// - 解析 URL
+/// - 向前端发射 `deeplink-import` / `deeplink-error` 事件
+/// - 可选：在成功时聚焦主窗口
+fn handle_deeplink_url(
+    app: &tauri::AppHandle,
+    url_str: &str,
+    focus_main_window: bool,
+    source: &str,
+) -> bool {
+    if !url_str.starts_with("ccswitch://") {
+        return false;
+    }
+
+    log::info!("✓ Deep link URL detected from {source}: {url_str}");
+
+    match crate::deeplink::parse_deeplink_url(url_str) {
+        Ok(request) => {
+            log::info!(
+                "✓ Successfully parsed deep link: resource={}, app={}, name={}",
+                request.resource,
+                request.app,
+                request.name
+            );
+
+            if let Err(e) = app.emit("deeplink-import", &request) {
+                log::error!("✗ Failed to emit deeplink-import event: {e}");
+            } else {
+                log::info!("✓ Emitted deeplink-import event to frontend");
+            }
+
+            if focus_main_window {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                    log::info!("✓ Window shown and focused");
+                }
+            }
+        }
+        Err(e) => {
+            log::error!("✗ Failed to parse deep link URL: {e}");
+
+            if let Err(emit_err) = app.emit(
+                "deeplink-error",
+                serde_json::json!({
+                    "url": url_str,
+                    "error": e.to_string()
+                }),
+            ) {
+                log::error!("✗ Failed to emit deeplink-error event: {emit_err}");
+            }
+        }
+    }
+
+    true
 }
 
 //
 
 /// 内部切换供应商函数
-async fn switch_provider_internal(
+fn switch_provider_internal(
     app: &tauri::AppHandle,
     app_type: crate::app_config::AppType,
     provider_id: String,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     if let Some(app_state) = app.try_state::<AppState>() {
         // 在使用前先保存需要的值
         let app_type_str = app_type.as_str().to_string();
         let provider_id_clone = provider_id.clone();
 
-        crate::commands::switch_provider(
-            app_state.clone(),
-            Some(app_type),
-            None,
-            None,
-            provider_id,
-        )
-        .await?;
+        crate::commands::switch_provider(app_state.clone(), app_type_str.clone(), provider_id)
+            .map_err(AppError::Message)?;
 
         // 切换成功后重新创建托盘菜单
         if let Ok(new_menu) = create_tray_menu(app, app_state.inner()) {
             if let Some(tray) = app.tray_by_id("main") {
                 if let Err(e) = tray.set_menu(Some(new_menu)) {
-                    log::error!("更新托盘菜单失败: {}", e);
+                    log::error!("更新托盘菜单失败: {e}");
                 }
             }
         }
@@ -287,7 +377,7 @@ async fn switch_provider_internal(
             "providerId": provider_id_clone
         });
         if let Err(e) = app.emit("provider-switched", event_data) {
-            log::error!("发射供应商切换事件失败: {}", e);
+            log::error!("发射供应商切换事件失败: {e}");
         }
     }
     Ok(())
@@ -299,14 +389,20 @@ async fn update_tray_menu(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<bool, String> {
-    if let Ok(new_menu) = create_tray_menu(&app, state.inner()) {
-        if let Some(tray) = app.tray_by_id("main") {
-            tray.set_menu(Some(new_menu))
-                .map_err(|e| format!("更新托盘菜单失败: {}", e))?;
-            return Ok(true);
+    match create_tray_menu(&app, state.inner()) {
+        Ok(new_menu) => {
+            if let Some(tray) = app.tray_by_id("main") {
+                tray.set_menu(Some(new_menu))
+                    .map_err(|e| format!("更新托盘菜单失败: {e}"))?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+        Err(err) => {
+            log::error!("创建托盘菜单失败: {err}");
+            Ok(false)
         }
     }
-    Ok(false)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -315,7 +411,27 @@ pub fn run() {
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            log::info!("=== Single Instance Callback Triggered ===");
+            log::info!("Args count: {}", args.len());
+            for (i, arg) in args.iter().enumerate() {
+                log::info!("  arg[{i}]: {arg}");
+            }
+
+            // Check for deep link URL in args (mainly for Windows/Linux command line)
+            let mut found_deeplink = false;
+            for arg in &args {
+                if handle_deeplink_url(app, arg, false, "single_instance args") {
+                    found_deeplink = true;
+                    break;
+                }
+            }
+
+            if !found_deeplink {
+                log::info!("ℹ No deep link URL found in args (this is expected on macOS when launched via system)");
+            }
+
+            // Show and focus window regardless
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
                 let _ = window.show();
@@ -325,6 +441,8 @@ pub fn run() {
     }
 
     let builder = builder
+        // 注册 deep-link 插件（处理 macOS AppleEvent 和其他平台的深链接）
+        .plugin(tauri_plugin_deep_link::init())
         // 拦截窗口关闭：根据设置决定是否最小化到托盘
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -351,8 +469,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .setup(|app| {
-            // 设置全局 AppHandle 以供 Store 使用
-            app_store::set_app_handle(app.handle().clone());
             // 注册 Updater 插件（桌面端）
             #[cfg(desktop)]
             {
@@ -361,7 +477,7 @@ pub fn run() {
                     .plugin(tauri_plugin_updater::Builder::new().build())
                 {
                     // 若配置不完整（如缺少 pubkey），跳过 Updater 而不中断应用
-                    log::warn!("初始化 Updater 插件失败，已跳过：{}", e);
+                    log::warn!("初始化 Updater 插件失败，已跳过：{e}");
                 }
             }
             #[cfg(target_os = "macos")]
@@ -403,28 +519,79 @@ pub fn run() {
                 )?;
             }
 
+            // 预先刷新 Store 覆盖配置，确保 AppState 初始化时可读取到最新路径
+            app_store::refresh_app_config_dir_override(app.handle());
+
             // 初始化应用状态（仅创建一次，并在本函数末尾注入 manage）
-            let app_state = AppState::new();
+            // 如果配置解析失败，则向前端发送错误事件并提前结束 setup（不落盘、不覆盖配置）。
+            let app_state = match AppState::try_new() {
+                Ok(state) => state,
+                Err(err) => {
+                    let path = crate::config::get_app_config_path();
+                    let payload_json = serde_json::json!({
+                        "path": path.display().to_string(),
+                        "error": err.to_string(),
+                    });
+                    // 事件通知（可能早于前端订阅，不保证送达）
+                    if let Err(e) = app.emit("configLoadError", payload_json) {
+                        log::error!("发射配置加载错误事件失败: {e}");
+                    }
+                    // 同时缓存错误，供前端启动阶段主动拉取
+                    crate::init_status::set_init_error(crate::init_status::InitErrorPayload {
+                        path: path.display().to_string(),
+                        error: err.to_string(),
+                    });
+                    // 不再继续构建托盘/命令依赖的状态，交由前端提示后退出。
+                    return Ok(());
+                }
+            };
 
             // 迁移旧的 app_config_dir 配置到 Store
-            if let Err(e) = app_store::migrate_app_config_dir_from_settings(&app.handle()) {
-                log::warn!("迁移 app_config_dir 失败: {}", e);
+            if let Err(e) = app_store::migrate_app_config_dir_from_settings(app.handle()) {
+                log::warn!("迁移 app_config_dir 失败: {e}");
             }
 
-            // 首次启动迁移：扫描副本文件，合并到 config.json，并归档副本；旧 config.json 先归档
+            // 确保配置结构就绪（已移除旧版本的副本迁移逻辑）
             {
-                let mut config_guard = app_state.config.lock().unwrap();
-                let migrated = migration::migrate_copies_into_config(&mut config_guard)?;
-                if migrated {
-                    log::info!("已将副本文件导入到 config.json，并完成归档");
-                }
-                // 确保两个 App 条目存在
+                let mut config_guard = app_state.config.write().unwrap();
                 config_guard.ensure_app(&app_config::AppType::Claude);
                 config_guard.ensure_app(&app_config::AppType::Codex);
             }
 
-            // 保存配置
-            let _ = app_state.save();
+            // 启动阶段不再无条件保存,避免意外覆盖用户配置。
+
+            // 注册 deep-link URL 处理器（使用正确的 DeepLinkExt API）
+            log::info!("=== Registering deep-link URL handler ===");
+
+            // Linux 和 Windows 调试模式需要显式注册
+            #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
+            {
+                if let Err(e) = app.deep_link().register_all() {
+                    log::error!("✗ Failed to register deep link schemes: {}", e);
+                } else {
+                    log::info!("✓ Deep link schemes registered (Linux/Windows)");
+                }
+            }
+
+            // 注册 URL 处理回调（所有平台通用）
+            app.deep_link().on_open_url({
+                let app_handle = app.handle().clone();
+                move |event| {
+                    log::info!("=== Deep Link Event Received (on_open_url) ===");
+                    let urls = event.urls();
+                    log::info!("Received {} URL(s)", urls.len());
+
+                    for (i, url) in urls.iter().enumerate() {
+                        let url_str = url.as_str();
+                        log::info!("  URL[{i}]: {url_str}");
+
+                        if handle_deeplink_url(&app_handle, url_str, true, "on_open_url") {
+                            break; // Process only first ccswitch:// URL
+                        }
+                    }
+                }
+            });
+            log::info!("✓ Deep-link URL handler registered");
 
             // 创建动态托盘菜单
             let menu = create_tray_menu(app.handle(), &app_state)?;
@@ -449,6 +616,7 @@ pub fn run() {
             // 将同一个实例注入到全局状态，避免重复创建导致的不一致
             app.manage(app_state);
 
+<<<<<<< HEAD
             // 初始化代理服务器
             proxy::init_proxy_server();
 
@@ -469,6 +637,18 @@ pub fn run() {
                     }
                 });
             }
+=======
+            // 初始化 SkillService
+            match SkillService::new() {
+                Ok(skill_service) => {
+                    app.manage(commands::skill::SkillServiceState(Arc::new(skill_service)));
+                }
+                Err(e) => {
+                    log::warn!("初始化 SkillService 失败: {e}");
+                }
+            }
+
+>>>>>>> pr-1
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -486,8 +666,13 @@ pub fn run() {
             commands::open_config_folder,
             commands::pick_directory,
             commands::open_external,
+            commands::get_init_error,
             commands::get_app_config_path,
             commands::open_app_config_folder,
+            commands::get_claude_common_config_snippet,
+            commands::set_claude_common_config_snippet,
+            commands::get_common_config_snippet,
+            commands::set_common_config_snippet,
             commands::read_live_provider_settings,
             commands::get_settings,
             commands::save_settings,
@@ -505,16 +690,25 @@ pub fn run() {
             commands::delete_claude_mcp_server,
             commands::validate_mcp_command,
             // usage query
-            commands::query_provider_usage,
+            commands::queryProviderUsage,
+            commands::testUsageScript,
             // New MCP via config.json (SSOT)
             commands::get_mcp_config,
             commands::upsert_mcp_server_in_config,
             commands::delete_mcp_server_in_config,
             commands::set_mcp_enabled,
-            commands::sync_enabled_mcp_to_claude,
-            commands::sync_enabled_mcp_to_codex,
-            commands::import_mcp_from_claude,
-            commands::import_mcp_from_codex,
+            // v3.7.0: Unified MCP management
+            commands::get_mcp_servers,
+            commands::upsert_mcp_server,
+            commands::delete_mcp_server,
+            commands::toggle_mcp_app,
+            // Prompt management
+            commands::get_prompts,
+            commands::upsert_prompt,
+            commands::delete_prompt,
+            commands::enable_prompt,
+            commands::import_prompt_from_file,
+            commands::get_current_prompt_file_content,
             // ours: endpoint speed test + custom endpoint management
             commands::test_api_endpoints,
             commands::get_custom_endpoints,
@@ -531,11 +725,26 @@ pub fn run() {
             commands::handle_operation_mode_change,
             commands::sync_proxy_common_config,
             // theirs: config import/export and dialogs
-            import_export::export_config_to_file,
-            import_export::import_config_from_file,
-            import_export::save_file_dialog,
-            import_export::open_file_dialog,
+            commands::export_config_to_file,
+            commands::import_config_from_file,
+            commands::save_file_dialog,
+            commands::open_file_dialog,
+            commands::sync_current_providers_live,
+            // Deep link import
+            commands::parse_deeplink,
+            commands::import_from_deeplink,
             update_tray_menu,
+            // Environment variable management
+            commands::check_env_conflicts,
+            commands::delete_env_vars,
+            commands::restore_env_backup,
+            // Skill management
+            commands::get_skills,
+            commands::install_skill,
+            commands::uninstall_skill,
+            commands::get_skill_repos,
+            commands::add_skill_repo,
+            commands::remove_skill_repo,
         ]);
 
     let app = builder
@@ -544,17 +753,74 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         #[cfg(target_os = "macos")]
-        // macOS 在 Dock 图标被点击并重新激活应用时会触发 Reopen 事件，这里手动恢复主窗口
-        if let RunEvent::Reopen { .. } = event {
-            if let Some(window) = app_handle.get_webview_window("main") {
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = window.set_skip_taskbar(false);
+        {
+            match event {
+                // macOS 在 Dock 图标被点击并重新激活应用时会触发 Reopen 事件，这里手动恢复主窗口
+                RunEvent::Reopen { .. } => {
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        #[cfg(target_os = "windows")]
+                        {
+                            let _ = window.set_skip_taskbar(false);
+                        }
+                        let _ = window.unminimize();
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        apply_tray_policy(app_handle, true);
+                    }
                 }
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-                apply_tray_policy(app_handle, true);
+                // 处理通过自定义 URL 协议触发的打开事件（例如 ccswitch://...）
+                RunEvent::Opened { urls } => {
+                    if let Some(url) = urls.first() {
+                        let url_str = url.to_string();
+                        log::info!("RunEvent::Opened with URL: {url_str}");
+
+                        if url_str.starts_with("ccswitch://") {
+                            // 解析并广播深链接事件，复用与 single_instance 相同的逻辑
+                            match crate::deeplink::parse_deeplink_url(&url_str) {
+                                Ok(request) => {
+                                    log::info!(
+                                        "Successfully parsed deep link from RunEvent::Opened: resource={}, app={}",
+                                        request.resource,
+                                        request.app
+                                    );
+
+                                    if let Err(e) =
+                                        app_handle.emit("deeplink-import", &request)
+                                    {
+                                        log::error!(
+                                            "Failed to emit deep link event from RunEvent::Opened: {e}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "Failed to parse deep link URL from RunEvent::Opened: {e}"
+                                    );
+
+                                    if let Err(emit_err) = app_handle.emit(
+                                        "deeplink-error",
+                                        serde_json::json!({
+                                            "url": url_str,
+                                            "error": e.to_string()
+                                        }),
+                                    ) {
+                                        log::error!(
+                                            "Failed to emit deep link error event from RunEvent::Opened: {emit_err}"
+                                        );
+                                    }
+                                }
+                            }
+
+                            // 确保主窗口可见
+                            if let Some(window) = app_handle.get_webview_window("main") {
+                                let _ = window.unminimize();
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 

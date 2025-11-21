@@ -22,6 +22,9 @@ pub struct Provider {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "sortIndex")]
     pub sort_index: Option<usize>,
+    /// 备注信息
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
     /// 供应商元数据（不写入 live 配置，仅存于 ~/.cc-switch/config.json）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<ProviderMeta>,
@@ -47,6 +50,7 @@ impl Provider {
             category: None,
             created_at: None,
             sort_index: None,
+            notes: None,
             meta: None,
             proxy_enabled: None,
         }
@@ -68,6 +72,26 @@ pub struct UsageScript {
     pub code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+    /// 用量查询专用的 API Key（通用模板使用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "apiKey")]
+    pub api_key: Option<String>,
+    /// 用量查询专用的 Base URL（通用和 NewAPI 模板使用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "baseUrl")]
+    pub base_url: Option<String>,
+    /// 访问令牌（用于需要登录的接口，NewAPI 模板使用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "accessToken")]
+    pub access_token: Option<String>,
+    /// 用户ID（用于需要用户标识的接口，NewAPI 模板使用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "userId")]
+    pub user_id: Option<String>,
+    /// 自动查询间隔（单位：分钟，0 表示禁用自动查询）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "autoQueryInterval")]
+    pub auto_query_interval: Option<u64>,
 }
 
 /// 用量数据
@@ -113,6 +137,15 @@ pub struct ProviderMeta {
     /// 用量查询脚本配置
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_script: Option<UsageScript>,
+    /// 合作伙伴标记（前端使用 isPartner，保持字段名一致）
+    #[serde(rename = "isPartner", skip_serializing_if = "Option::is_none")]
+    pub is_partner: Option<bool>,
+    /// 合作伙伴促销 key，用于识别 PackyCode 等特殊供应商
+    #[serde(
+        rename = "partnerPromotionKey",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub partner_promotion_key: Option<String>,
 }
 
 impl ProviderManager {
